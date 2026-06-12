@@ -270,7 +270,7 @@ with DAG(
     dag_id="ml_pipeline_dag",
     description="CS611 A2 — loan default ML pipeline with shadow-mode challenger governance",
     start_date=datetime(2023, 1, 1),
-    end_date=datetime(2024, 6, 1),   # source data covers Jan 2023 – Jun 2024
+    end_date=datetime(2024, 12, 1),  # run through Dec 2024 to build test/OOT label stores
     schedule_interval="@monthly",
     catchup=True,
     max_active_runs=1,

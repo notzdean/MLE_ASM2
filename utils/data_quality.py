@@ -49,7 +49,11 @@ def run_data_quality(
     print("\n[data_quality] --- Feature Store ---")
 
     if not os.path.exists(feature_file):
-        issues.append(f"Feature store partition missing: {feature_file}")
+        # Not a critical failure — clickstream data only covers Jan 2023 – Jul 2024.
+        # Months after Jul 2024 have no clickstream so no feature store is built,
+        # but training and monitoring still run using all historical data.
+        warnings.append(f"Feature store partition missing (no clickstream data for this month): {feature_file}")
+        print(f"  ⚠️  No feature store for {snapshot_date_str} — inference will skip, training unaffected")
     else:
         df = pd.read_parquet(feature_file)
         n_rows, n_cols = df.shape
