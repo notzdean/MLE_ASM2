@@ -78,9 +78,12 @@ def _create_spark():
         pyspark.sql.SparkSession.builder
         .appName("cs611_ml_pipeline")
         .master("local[2]")
-        .config("spark.driver.memory", "2g")
+        .config("spark.driver.memory", "4g")
+        .config("spark.driver.maxResultSize", "2g")
         .config("spark.driver.bindAddress", "127.0.0.1")
         .config("spark.sql.adaptive.enabled", "true")
+        .config("spark.network.timeout", "600s")
+        .config("spark.executor.heartbeatInterval", "60s")
         .getOrCreate()
     )
     spark.sparkContext.setLogLevel("ERROR")
