@@ -9,6 +9,7 @@ decisions (predicted_label). The challenger score is recorded for comparison
 in model_monitoring so it can be evaluated against the champion over time.
 """
 
+import glob
 import json
 import os
 import pickle
@@ -16,6 +17,16 @@ import pickle
 import pandas as pd
 
 from utils.model_training import _engineer_features
+
+
+def _loan_customer_ids(gold_label_store_dir: str) -> set:
+    """Return the set of Customer_IDs that appear in any label store partition.
+    These are definitively loan customers — the only population the model was
+    trained on and the only population that makes business sense to score."""
+    ids = set()
+    for f in glob.glob(os.path.join(gold_label_store_dir, "*.parquet")):
+        ids.update(pd.read_parquet(f, columns=["Customer_ID"])["Customer_ID"].tolist())
+    return ids
 
 
 def _score_bundle(bundle: dict, df: pd.DataFrame) -> pd.Series:
@@ -37,6 +48,7 @@ def run_inference(
     gold_feature_store_dir: str,
     predictions_dir: str,
     model_store_dir: str,
+    gold_label_store_dir: str = None,
 ):
     champion_path = os.path.join(model_store_dir, "champion_model.pkl")
     meta_path     = os.path.join(model_store_dir, "model_metadata.json")
@@ -63,14 +75,16 @@ def run_inference(
 
     df = pd.read_parquet(feature_file)
 
-    # Only score loan customers (those with attributes/financials).
-    # Clickstream visitors who never applied for a loan have NaN for all
-    # financial columns — imputing them to median produces a score distribution
-    # that is completely different from the training population (loan customers
-    # only), making PSI and CSI artificially inflate to > 1.0.
-    loan_customer_mask = df["Annual_Income"].notna() | df["Age"].notna()
+    # Filter to loan customers only. Annual_Income grows non-null over time as the
+    # financials join picks up more historical records, so notna() alone is not a
+    # reliable filter. Instead use the label store — every Customer_ID that ever
+    # appears there is definitively a loan customer.
     n_total = len(df)
-    df = df[loan_customer_mask].copy()
+    if gold_label_store_dir and os.path.isdir(gold_label_store_dir):
+        loan_ids = _loan_customer_ids(gold_label_store_dir)
+        df = df[df["Customer_ID"].isin(loan_ids)].copy()
+    else:
+        df = df[df["Annual_Income"].notna()].copy()
     print(
         f"[inference] {snapshot_date_str} — filtered to loan customers: "
         f"{len(df)}/{n_total} rows"

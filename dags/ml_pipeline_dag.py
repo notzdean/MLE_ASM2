@@ -243,6 +243,7 @@ def run_model_inference(ds: str, **kwargs):
         gold_feature_store_dir=GOLD_FEATURE_DIR,
         predictions_dir=PREDICTIONS_DIR,
         model_store_dir=MODEL_STORE_DIR,
+        gold_label_store_dir=GOLD_LABEL_DIR,
     )
 
 
