@@ -1,0 +1,11 @@
+# ML & data science
+pyspark==3.5.5
+scikit-learn==1.6.1
+xgboost==2.1.4
+scipy==1.15.1
+matplotlib==3.10.0
+seaborn==0.13.2
+pyarrow==18.1.0
+
+# Airflow Postgres backend
+psycopg2-binary==2.9.9
