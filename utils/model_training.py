@@ -275,32 +275,49 @@ def _run_training_pipeline(
     rf.fit(X_train_sc, y_train)
 
     # --- XGBoost with RandomizedSearchCV ---
+    # Scaler is placed INSIDE the CV pipeline so each fold fits its own scaler
+    # on the fold's training data only — prevents train-test contamination within CV.
+    # We then refit the best hyperparameters on the pre-scaled X_train_sc so all three
+    # models are evaluated on the same scaled data for a fair comparison.
     print("[training] running RandomizedSearchCV for XGBoost ...")
     xgb_base = xgb.XGBClassifier(
         eval_metric="logloss", random_state=42, verbosity=0,
         scale_pos_weight=(y_train == 0).sum() / max((y_train == 1).sum(), 1),
     )
+    # clf__ prefix targets the XGBoost step inside the Pipeline
     param_dist = {
-        "n_estimators":     [25, 50, 100, 200],
-        "max_depth":        [2, 3, 4],
-        "learning_rate":    [0.01, 0.05, 0.1],
-        "subsample":        [0.6, 0.8, 1.0],
-        "colsample_bytree": [0.6, 0.8, 1.0],
-        "gamma":            [0, 0.1, 0.2],
-        "min_child_weight": [1, 3, 5],
-        "reg_alpha":        [0, 0.1, 1.0],
-        "reg_lambda":       [1.0, 1.5, 2.0],
+        "clf__n_estimators":     [25, 50, 100, 200],
+        "clf__max_depth":        [2, 3, 4],
+        "clf__learning_rate":    [0.01, 0.05, 0.1],
+        "clf__subsample":        [0.6, 0.8, 1.0],
+        "clf__colsample_bytree": [0.6, 0.8, 1.0],
+        "clf__gamma":            [0, 0.1, 0.2],
+        "clf__min_child_weight": [1, 3, 5],
+        "clf__reg_alpha":        [0, 0.1, 1.0],
+        "clf__reg_lambda":       [1.0, 1.5, 2.0],
     }
-    auc_scorer = make_scorer(roc_auc_score, needs_proba=True)
+    from sklearn.pipeline import Pipeline as _CVPipeline
+    cv_pipeline = _CVPipeline([("scaler", StandardScaler()), ("clf", xgb_base)])
+    auc_scorer  = make_scorer(roc_auc_score, needs_proba=True)
     rscv = RandomizedSearchCV(
-        estimator=xgb_base, param_distributions=param_dist,
+        estimator=cv_pipeline, param_distributions=param_dist,
         scoring=auc_scorer, n_iter=10, cv=3,
         verbose=1, random_state=42, n_jobs=-1,
     )
-    rscv.fit(X_train_sc, y_train)
-    xgb_best = rscv.best_estimator_
-    best_hp  = rscv.best_params_
+    # Fit on X_train_imp (imputed, not pre-scaled) so each fold scales independently
+    rscv.fit(X_train_imp, y_train)
+
+    # Strip "clf__" prefix to get clean hyperparameter dict
+    best_hp = {k.replace("clf__", ""): v for k, v in rscv.best_params_.items()}
     print(f"[training] XGBoost best params: {best_hp}")
+
+    # Refit best XGBoost on the shared pre-scaled data for consistent evaluation with LR/RF
+    xgb_best = xgb.XGBClassifier(
+        **best_hp,
+        eval_metric="logloss", random_state=42, verbosity=0,
+        scale_pos_weight=(y_train == 0).sum() / max((y_train == 1).sum(), 1),
+    )
+    xgb_best.fit(X_train_sc, y_train)
 
     # --- Evaluate all three ---
     candidates = {
