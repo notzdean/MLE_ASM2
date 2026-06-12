@@ -42,20 +42,22 @@ sys.path.insert(0, os.environ.get("AIRFLOW_HOME", "/opt/airflow"))
 # Paths — all relative to AIRFLOW_HOME so they work inside Docker
 # ---------------------------------------------------------------------------
 BASE = os.environ.get("AIRFLOW_HOME", "/opt/airflow")
-DATA_DIR               = os.path.join(BASE, "data")
-BRONZE_LMS_DIR         = os.path.join(BASE, "datamart", "bronze", "lms")
-SILVER_LOAN_DIR        = os.path.join(BASE, "datamart", "silver", "loan_daily")
-GOLD_LABEL_DIR         = os.path.join(BASE, "datamart", "gold", "label_store")
-BRONZE_CLICKSTREAM_DIR = os.path.join(BASE, "datamart", "bronze", "clickstream")
-BRONZE_ATTRIBUTES_DIR  = os.path.join(BASE, "datamart", "bronze", "attributes")
-BRONZE_FINANCIALS_DIR  = os.path.join(BASE, "datamart", "bronze", "financials")
-SILVER_CLICKSTREAM_DIR = os.path.join(BASE, "datamart", "silver", "clickstream")
-SILVER_ATTRIBUTES_DIR  = os.path.join(BASE, "datamart", "silver", "attributes")
-SILVER_FINANCIALS_DIR  = os.path.join(BASE, "datamart", "silver", "financials")
-GOLD_FEATURE_DIR       = os.path.join(BASE, "datamart", "gold", "feature_store")
-PREDICTIONS_DIR        = os.path.join(BASE, "datamart", "gold", "predictions")
-MONITORING_DIR         = os.path.join(BASE, "datamart", "gold", "monitoring")
-MODEL_STORE_DIR        = os.path.join(BASE, "model_store")
+# All dir paths end with "/" so both A1-style (dir + filename) and
+# os.path.join(dir, filename) produce the same result.
+DATA_DIR               = os.path.join(BASE, "data") + "/"
+BRONZE_LMS_DIR         = os.path.join(BASE, "datamart", "bronze", "lms") + "/"
+SILVER_LOAN_DIR        = os.path.join(BASE, "datamart", "silver", "loan_daily") + "/"
+GOLD_LABEL_DIR         = os.path.join(BASE, "datamart", "gold", "label_store") + "/"
+BRONZE_CLICKSTREAM_DIR = os.path.join(BASE, "datamart", "bronze", "clickstream") + "/"
+BRONZE_ATTRIBUTES_DIR  = os.path.join(BASE, "datamart", "bronze", "attributes") + "/"
+BRONZE_FINANCIALS_DIR  = os.path.join(BASE, "datamart", "bronze", "financials") + "/"
+SILVER_CLICKSTREAM_DIR = os.path.join(BASE, "datamart", "silver", "clickstream") + "/"
+SILVER_ATTRIBUTES_DIR  = os.path.join(BASE, "datamart", "silver", "attributes") + "/"
+SILVER_FINANCIALS_DIR  = os.path.join(BASE, "datamart", "silver", "financials") + "/"
+GOLD_FEATURE_DIR       = os.path.join(BASE, "datamart", "gold", "feature_store") + "/"
+PREDICTIONS_DIR        = os.path.join(BASE, "datamart", "gold", "predictions") + "/"
+MONITORING_DIR         = os.path.join(BASE, "datamart", "gold", "monitoring") + "/"
+MODEL_STORE_DIR        = os.path.join(BASE, "model_store") + "/"
 
 PSI_RETRAIN_THRESHOLD = 0.25   # matches model_monitoring.py
 AUC_DROP_THRESHOLD    = 0.05   # retrain if champion AUC drops more than this

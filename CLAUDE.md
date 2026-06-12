@@ -53,7 +53,9 @@ Use **our own A1 pipeline** (not classmates') because it is the most complete im
 
 ### Data leakage prevention (critical)
 - **Label at MOB 6:** The label is `dpd >= 30` at the customer's 6th month on book. The feature snapshot_date is the loan origination month. Label is measured 6 months later — never use any data from those 6 months as features.
-- **Temporal train/test split (no shuffling):** Train on loans originated **Jan 2023 – Jun 2024**, test on **Jul 2024 – Dec 2024**. The join is `feature.snapshot_date == label.snapshot_date`.
+- **Temporal train/test/OOT split (no shuffling):** Train ≤ 2023-12-01, Test Jan–Mar 2024, OOT Apr–Jun 2024. The join is `feature.snapshot_date == label.snapshot_date`.
+  - Note: label store partition is named by **measurement date** (the month the label is observed), not origination date. `gold_label_store_2023_07_01.parquet` contains loans **originated Jan 2023** at MOB 6 as of Jul 2023. `_load_labeled_dataset` subtracts 6 months from label partition date to find the matching feature origination date.
+  - First valid labeled training data = **Jul 2023** run (earliest label available, pointing to Jan 2023 features).
 - **Attributes/financials join:** Always filter `snapshot_date <= feature_partition_date` then take the most recent record (already implemented with `row_number()` in gold table).
 - **Never** include any loan outcome columns (`dpd`, `mob`, `loan_status`) in the feature set.
 
@@ -80,26 +82,28 @@ Save the best model artifact as `model_store/champion_model.pkl` plus a `model_s
 - Retrain trigger: PSI > 0.25 on score distribution OR AUC drops > 5 percentage points from baseline
 - Retraining cadence: Monthly check, retrain quarterly or when trigger fires
 - Deployment: Batch scoring (no real-time API needed for this use case — offline loan decisioning)
-- Champion/Challenger: Keep the previous champion in `model_store/` with timestamp until new champion validated
+- Champion/Challenger shadow mode: `challenger_model.pkl` runs in parallel for several months; auto-promotes to champion when it wins `CONSECUTIVE_WINS_REQUIRED` months in a row on labeled cohorts
+- Bootstrap: if no champion exists yet, `check_retrain_needed` always fires → `train_challenger` → auto-promotes immediately (no labeled comparison needed)
 
 ---
 
-## File Structure to Build
+## File Structure
 
 ```
 Assignment_2/
 ├── dags/
-│   └── ml_pipeline_dag.py          ← NEW: Airflow DAG (main orchestrator)
+│   └── ml_pipeline_dag.py          ← Airflow DAG (main orchestrator)
 ├── utils/
-│   ├── data_processing_bronze_table.py         ← copied from A1
-│   ├── data_processing_silver_table.py         ← copied from A1
-│   ├── data_processing_gold_table.py           ← copied from A1
-│   ├── data_processing_feature_bronze_table.py ← copied from A1
-│   ├── data_processing_feature_silver_table.py ← copied from A1
-│   ├── data_processing_feature_gold_table.py   ← copied from A1
+│   ├── data_processing_bronze_table.py         ← from A1 (PySpark)
+│   ├── data_processing_silver_table.py         ← from A1 (PySpark)
+│   ├── data_processing_gold_table.py           ← from A1 (PySpark)
+│   ├── data_processing_feature_bronze_table.py ← REWRITTEN to use pandas (was PySpark — OOM in Docker)
+│   ├── data_processing_feature_silver_table.py ← from A1 (PySpark)
+│   ├── data_processing_feature_gold_table.py   ← from A1 (PySpark)
+│   ├── data_quality.py             ← NEW: QC gate between data pipeline and model tasks
 │   ├── model_training.py           ← NEW
 │   ├── model_prediction.py         ← NEW
-│   └── model_monitoring.py         ← NEW
+│   └── model_monitoring.py         ← NEW (includes visualisation)
 ├── data/
 │   ├── feature_clickstream.csv
 │   ├── features_attributes.csv
@@ -111,12 +115,12 @@ Assignment_2/
 │   └── gold/
 │       ├── label_store/            ← monthly parquet partitions
 │       ├── feature_store/          ← monthly parquet partitions
-│       ├── predictions/            ← NEW: monthly inference output
-│       └── monitoring/             ← NEW: performance + stability results + plots
-├── model_store/                    ← NEW: champion_model.pkl, model_metadata.json
-├── Dockerfile                      ← UPDATE: add Airflow
-├── docker-compose.yaml             ← REPLACE: Airflow stack (was Jupyter-only)
-├── requirements.txt                ← UPDATE: add airflow, sklearn, xgboost, etc.
+│       ├── predictions/            ← monthly inference output
+│       └── monitoring/             ← performance + stability parquets + PNG plots
+├── model_store/                    ← champion_model.pkl, challenger_model.pkl, model_metadata.json
+├── Dockerfile
+├── docker-compose.yaml             ← Airflow stack (LocalExecutor + Postgres)
+├── requirements.txt
 └── Readme.txt                      ← 1 line: GitHub repo link
 ```
 
@@ -127,58 +131,72 @@ Assignment_2/
 **DAG id:** `ml_pipeline_dag`
 **Schedule:** `@monthly` (1st of each month, backfillable)
 **Start date:** 2023-01-01
+**max_active_runs:** 1 (prevents parallel backfill runs; months process sequentially)
 
-### Task order (linear chain)
+### Actual task graph (implemented)
 ```
-data_pipeline_task
-    >> model_training_task
-    >> model_inference_task
-    >> model_monitoring_task
-    >> model_visualisation_task
+data_pipeline
+    >> data_quality
+    >> check_retrain_needed  (BranchPythonOperator)
+         ↓ "train_challenger"        ↓ "skip_training"
+    train_challenger          skip_training (EmptyOperator)
+         ↓                               ↓
+    model_inference  ←─────────────────┘   (TriggerRule.NONE_FAILED_MIN_ONE_SUCCESS)
+    >> model_monitoring          (includes visualisation + auto-promotion)
 ```
 
-### data_pipeline_task
-Wraps all A1 data processing steps as a single `PythonOperator`. Runs for `{{ ds }}` (the DAG's logical date = snapshot month).
+### data_pipeline task
+Wraps all A1 data processing steps in one `PythonOperator`. All steps are idempotent (check file exists, skip if so) so retries are safe and fast.
 
-Steps (in order):
+Steps (sequential):
 1. Bronze LMS → Silver loan daily → Gold label store (for `{{ ds }}`)
 2. Bronze clickstream (for `{{ ds }}`), Bronze attributes (once), Bronze financials (once)
 3. Silver for all three feature sources
 4. Gold feature store (for `{{ ds }}`)
 
-### model_training_task
-Triggered only when enough data exists (skip if `{{ ds }}` < 2024-01-01 — need at least 12 months of labeled data).
+**Important:** Bronze feature tables use **pandas** not PySpark. The original A1 PySpark implementation caused `TaskResultLost` OOM errors inside Docker after processing multiple months. Since bronze feature steps are simple CSV copy/filter operations with no distributed processing need, pure pandas is correct here.
 
+### data_quality task
+Validates gold feature store and label store partitions for `{{ ds }}`. Raises `ValueError` on critical failures (missing file, empty partition, missing required columns) which marks all downstream tasks as `upstream_failed`.
+
+Null rate checks are **warnings only** — attributes/financials columns are expected to be 95%+ null in the gold feature store because clickstream covers all 8,974 visitors while only 530 are loan customers. Model training inner-joins with labels so only loan customers reach training.
+
+### check_retrain_needed task (BranchPythonOperator)
+Returns `"train_challenger"` or `"skip_training"`. Triggers retraining when ANY of:
+1. No champion exists yet (bootstrap — first ever run)
+2. `challenger_model.pkl` already exists (challenger in shadow mode — keep it fresh)
+3. Score PSI > 0.25 in latest monitoring
+4. Champion AUC dropped > 5pp from its baseline
+
+### train_challenger task
 Steps in `utils/model_training.py`:
 1. Load all gold feature store partitions + label store partitions
-2. Join on `Customer_ID` + `snapshot_date`
+2. Join on `Customer_ID` + `snapshot_date` (inner join — only loan customers have labels)
 3. Drop leakage columns (`dpd`, `mob`, `loan_status`, `snapshot_date`)
-4. Temporal split: train ≤ 2024-06-01, test > 2024-06-01
+4. Temporal split: Train ≤ 2023-12-01 | Test Jan–Mar 2024 | OOT Apr–Jun 2024
 5. Impute nulls (median for numeric, mode for categorical)
 6. Train Logistic Regression, Random Forest, XGBoost
-7. Evaluate all three → pick best AUC on test set
-8. Save `model_store/champion_model.pkl` + `model_store/model_metadata.json`
+7. Evaluate all three → pick best OOT AUC (falls back to test AUC if OOT unavailable)
+8. Save as `model_store/challenger_model.pkl` + `model_store/model_metadata.json`
+9. On bootstrap (no champion exists), immediately copy challenger → champion
 
-### model_inference_task
+**sklearn 1.6 note:** `make_scorer` no longer accepts `needs_proba=True`; use `response_method="predict_proba"` instead.
+
+### model_inference task
 Steps in `utils/model_prediction.py`:
-1. Load `champion_model.pkl` from `model_store/`
+1. Load `champion_model.pkl` (always scores) + `challenger_model.pkl` if it exists (shadow scores)
 2. Load gold feature store for current `{{ ds }}`
-3. Predict probability scores
-4. Save `datamart/gold/predictions/predictions_{{ ds }}.parquet` with columns: `Customer_ID`, `loan_id`, `snapshot_date`, `score`, `predicted_label` (threshold 0.5)
+3. Predict probability scores for both models
+4. Save `datamart/gold/predictions/predictions_{{ ds }}.parquet` with columns: `Customer_ID`, `snapshot_date`, `score`, `predicted_label` (threshold 0.5), `challenger_score`, `challenger_predicted_label`
 
-### model_monitoring_task
-Steps in `utils/model_monitoring.py`:
-1. Load all predictions gold tables (all months available)
-2. **Stability:** Compute PSI on score distribution vs. training distribution (baseline from model_metadata.json)
-3. **Performance:** For months where labels are available (snapshot_date + 6 months ≤ today), join predictions with labels, compute AUC/Gini/KS
-4. Save `datamart/gold/monitoring/monitoring_{{ ds }}.parquet` with all metrics
-
-### model_visualisation_task
-Steps (inline in DAG or in `utils/model_monitoring.py`):
-1. Load all monitoring parquet files
-2. Plot AUC / Gini / KS over time → save PNG to `datamart/gold/monitoring/`
-3. Plot PSI over time → save PNG
-4. Plot score distribution per month (overlaid) → save PNG
+### model_monitoring task
+Steps in `utils/model_monitoring.py` (visualisation is inline, no separate task):
+1. Load all prediction parquets
+2. **Stability:** PSI on score distribution vs. training baseline (from model_metadata.json)
+3. **Performance:** For months where labels are available (snapshot_date + 6 months ≤ today), compute AUC/Gini/KS for champion and challenger
+4. **Auto-promotion:** If challenger beats champion for `CONSECUTIVE_WINS_REQUIRED` months, copy challenger → champion and delete challenger
+5. Save `datamart/gold/monitoring/monitoring_{{ ds }}.parquet`
+6. Plot AUC/Gini/KS over time → PNG, PSI over time → PNG, score distributions overlaid → PNG
 
 ---
 
@@ -202,22 +220,57 @@ The `Dockerfile` must install: `apache-airflow`, `pyspark`, `scikit-learn`, `xgb
 
 ## Implementation Order
 
-1. Set up Docker + Airflow (`docker-compose.yaml`, `Dockerfile`, `requirements.txt`) — get the 2 marks first
-2. Create the Airflow DAG skeleton (`dags/ml_pipeline_dag.py`) with all 5 tasks stubbed out
-3. Wrap the A1 PySpark data pipeline functions as Airflow PythonOperators (one date per run)
-4. Write `utils/model_training.py`
-5. Write `utils/model_prediction.py`
-6. Write `utils/model_monitoring.py` with visualisations
-7. Wire all tasks into the DAG and do a backfill test
-8. Capture monitoring screenshots for the presentation deck
+1. ✅ Set up Docker + Airflow (`docker-compose.yaml`, `Dockerfile`, `requirements.txt`)
+2. ✅ Create the Airflow DAG (`dags/ml_pipeline_dag.py`) with all tasks
+3. ✅ Wrap A1 PySpark data pipeline as Airflow PythonOperator + add `data_quality` gate
+4. ✅ Write `utils/model_training.py` (challenger/champion governance, temporal split)
+5. ✅ Write `utils/model_prediction.py` (champion + shadow challenger scoring)
+6. ✅ Write `utils/model_monitoring.py` (PSI, AUC/Gini/KS, auto-promotion, PNG plots)
+7. ✅ Backfill running Jan 2023 → Dec 2024
+8. ⬜ Capture monitoring screenshots for the presentation deck (after backfill completes)
+9. ⬜ Build presentation deck (≤ 10 slides)
+
+---
+
+## Known Issues and Runtime Fixes
+
+### Spark OOM in bronze feature processing
+`toPandas()` on large DataFrames inside Docker causes `TaskResultLost` from the block manager. Even with `spark.driver.memory=4g`, the driver exhausts memory after processing multiple months in a single Airflow task. **Fix:** `data_processing_feature_bronze_table.py` now uses pandas for all three bronze functions — they are simple CSV copy/filter operations with no distributed processing need.
+
+### Path separator convention
+A1 code uses `dir + filename` string concatenation (no `os.path.join`), which requires a trailing `/` on directory paths. All `*_DIR` constants in `ml_pipeline_dag.py` are defined with `+ "/"` appended. Both `dir + filename` and `os.path.join(dir, filename)` then produce the same correct path.
+
+### sklearn 1.6 API change
+`make_scorer(roc_auc_score, needs_proba=True)` raises `TypeError` in sklearn 1.6+. Use `response_method="predict_proba"` instead.
+
+### f-string crash with None AUC
+`f"OOT AUC={m_oot['auc']:.4f if m_oot['auc'] else 'N/A'}"` — Python parses `:.4f if ...` as the format spec. Pre-compute: `oot_auc_str = f"{m_oot['auc']:.4f}" if m_oot['auc'] is not None else "N/A"`.
+
+### High null rates in gold feature store (expected, not an error)
+Clickstream has ~8,974 customers/month; attributes and financials only cover the ~530 loan customers. LEFT JOIN from clickstream produces 95%+ nulls in financial columns. `data_quality.py` treats this as a warning, not a critical failure. Training inner-joins with label store so only loan customers reach the model.
+
+### DAG task ordering with max_active_runs=1
+`max_active_runs=1` prevents new DAG runs from starting but does not stop already-running ones. If two runs are simultaneously "running", mark the later one Failed to free the slot, then let the earlier month complete first.
+
+### Fresh restart procedure
+```powershell
+docker-compose down -v   # removes Postgres volume (full Airflow DB reset)
+Remove-Item -Recurse -Force datamart\bronze\*, datamart\silver\*, datamart\gold\* -ErrorAction SilentlyContinue
+Remove-Item -Recurse -Force model_store\* -ErrorAction SilentlyContinue
+docker-compose up -d
+# wait ~30s, then toggle DAG ON in UI
+```
+
+### DAG vs Lab 5 comparison
+Lab 5 (`Lec 7/lab_5/dags/dag.py`) uses one `BashOperator` per bronze/silver/gold step with parallel fanout for independent sources. Our single `data_pipeline` PythonOperator is simpler but equally correct because all steps are idempotent — a retry skips already-completed files. The trade-off is less retry granularity vs a simpler DAG graph. Our DAG is more sophisticated on the ML side (branch logic, shadow mode, auto-promotion) which is what the assignment grades.
 
 ---
 
 ## Submission Checklist
-- [ ] `docker-compose build` succeeds
-- [ ] `docker-compose up` shows Airflow at localhost:8080
-- [ ] DAG appears in Airflow UI, can be triggered manually
-- [ ] Backfill runs: model artifacts appear in `model_store/`, predictions in `datamart/gold/predictions/`, monitoring in `datamart/gold/monitoring/`
+- [x] `docker-compose build` succeeds
+- [x] `docker-compose up` shows Airflow at localhost:8080
+- [x] DAG appears in Airflow UI, can be triggered manually
+- [ ] Backfill completes: model artifacts in `model_store/`, predictions in `datamart/gold/predictions/`, monitoring in `datamart/gold/monitoring/`
 - [ ] Monitoring plots saved as PNGs (needed for the deck)
 - [ ] `Readme.txt` contains GitHub repo link
 - [ ] Zip contains: dags/, utils/, data/, datamart/, model_store/, Dockerfile, docker-compose.yaml, requirements.txt, Readme.txt

@@ -298,7 +298,7 @@ def _run_training_pipeline(
     }
     from sklearn.pipeline import Pipeline as _CVPipeline
     cv_pipeline = _CVPipeline([("scaler", StandardScaler()), ("clf", xgb_base)])
-    auc_scorer  = make_scorer(roc_auc_score, needs_proba=True)
+    auc_scorer  = make_scorer(roc_auc_score, response_method="predict_proba")
     rscv = RandomizedSearchCV(
         estimator=cv_pipeline, param_distributions=param_dist,
         scoring=auc_scorer, n_iter=10, cv=3,
@@ -332,11 +332,12 @@ def _run_training_pipeline(
         m_oot   = (_eval_metrics(y_oot, pd.Series(clf.predict_proba(X_oot_sc)[:, 1]))
                    if len(X_oot_sc) > 0 else {"auc": None, "gini": None, "ks": None})
         results[name] = {"train": m_train, "test": m_test, "oot": m_oot, "clf": clf}
+        oot_auc_str = f"{m_oot['auc']:.4f}" if m_oot['auc'] is not None else "N/A"
         print(
             f"  {name:25s}  "
             f"Train AUC={m_train['auc']:.4f}  "
             f"Test AUC={m_test['auc']:.4f}  "
-            f"OOT AUC={m_oot['auc']:.4f if m_oot['auc'] else 'N/A'}"
+            f"OOT AUC={oot_auc_str}"
         )
 
     def _score(name):
