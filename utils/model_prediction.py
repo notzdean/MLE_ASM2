@@ -62,6 +62,20 @@ def run_inference(
         return
 
     df = pd.read_parquet(feature_file)
+
+    # Only score loan customers (those with attributes/financials).
+    # Clickstream visitors who never applied for a loan have NaN for all
+    # financial columns — imputing them to median produces a score distribution
+    # that is completely different from the training population (loan customers
+    # only), making PSI and CSI artificially inflate to > 1.0.
+    loan_customer_mask = df["Annual_Income"].notna() | df["Age"].notna()
+    n_total = len(df)
+    df = df[loan_customer_mask].copy()
+    print(
+        f"[inference] {snapshot_date_str} — filtered to loan customers: "
+        f"{len(df)}/{n_total} rows"
+    )
+
     df = _engineer_features(df)   # same ratio features applied at training time
 
     # --- Champion scoring (production score) ---
