@@ -115,7 +115,9 @@ def _engineer_features(df: pd.DataFrame) -> pd.DataFrame:
 
 def _eval_metrics(y_true, y_score):
     """Return AUC, Gini, KS. Handles edge cases."""
-    if len(y_true) < 5 or y_true.nunique() < 2:
+    y_true  = np.asarray(y_true)
+    y_score = np.asarray(y_score)
+    if len(y_true) < 5 or len(np.unique(y_true)) < 2:
         return {"auc": None, "gini": None, "ks": None}
     auc  = float(roc_auc_score(y_true, y_score))
     gini = float(2 * auc - 1)
