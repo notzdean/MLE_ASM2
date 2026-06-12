@@ -61,6 +61,12 @@ FEATURE_COLS = (
         "Monthly_Balance",                      # financials (22)
         # Engineered ratio features (added at training time — not in gold store)
         "debt_to_income", "emi_to_salary", "debt_per_loan",
+        # Cash flow stress
+        "free_cash_flow_ratio", "savings_rate",
+        # Credit behavior quality
+        "inquiry_rate",
+        # Clickstream behavioral aggregates
+        "clickstream_total", "clickstream_active_channels",
     ]
 )
 
@@ -70,11 +76,36 @@ FEATURE_COLS = (
 # ---------------------------------------------------------------------------
 
 def _engineer_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Add domain-driven ratio features. All inputs available at origination — no leakage."""
+    """
+    Add domain-driven engineered features. All inputs are available at loan
+    origination — no future data, no leakage.
+    """
     df = df.copy()
+
+    # --- Leverage / repayment burden (from Lam Nguyen inspiration) ---
     df["debt_to_income"] = df["Outstanding_Debt"] / df["Annual_Income"].clip(lower=1)
     df["emi_to_salary"]  = df["Total_EMI_per_month"] / df["Monthly_Inhand_Salary"].clip(lower=1)
     df["debt_per_loan"]  = df["Outstanding_Debt"] / df["Num_of_Loan"].clip(lower=1)
+
+    # --- Cash flow stress ---
+    # Negative free_cash_flow_ratio means EMIs exceed take-home pay — high default risk
+    salary = df["Monthly_Inhand_Salary"].clip(lower=1)
+    df["free_cash_flow_ratio"] = (df["Monthly_Inhand_Salary"] - df["Total_EMI_per_month"]) / salary
+    # High savings rate signals financial discipline
+    df["savings_rate"] = df["Amount_invested_monthly"] / salary
+
+    # --- Credit behaviour quality ---
+    # Frequent credit inquiries relative to history length = financial stress seeking
+    df["inquiry_rate"] = (
+        df["Num_Credit_Inquiries"] / df["credit_history_months"].clip(lower=1)
+    )
+
+    # --- Clickstream behavioural aggregates ---
+    fe_cols = [c for c in df.columns if c.startswith("fe_")]
+    if fe_cols:
+        df["clickstream_total"]           = df[fe_cols].sum(axis=1)
+        df["clickstream_active_channels"] = (df[fe_cols] > 0).sum(axis=1)
+
     return df
 
 
