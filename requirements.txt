@@ -1,3 +1,8 @@
+# Core data
+pandas==2.2.3
+numpy==1.26.4
+python-dateutil==2.9.0
+
 # ML & data science
 pyspark==3.5.5
 scikit-learn==1.6.1
