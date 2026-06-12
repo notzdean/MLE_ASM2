@@ -10,6 +10,8 @@ import pickle
 
 import pandas as pd
 
+from utils.model_training import _engineer_features
+
 
 def run_inference(
     snapshot_date_str: str,
@@ -45,12 +47,16 @@ def run_inference(
         return
 
     df = pd.read_parquet(feature_file)
+
+    # Apply same feature engineering as training (ratio features)
+    df = _engineer_features(df)
+
     available = [c for c in feature_cols if c in df.columns]
 
     # Apply same preprocessing as training
-    X           = df[available]
-    X_imputed   = pd.DataFrame(imputer.transform(X),   columns=available)
-    X_scaled    = scaler.transform(X_imputed)
+    X         = df[available]
+    X_imputed = pd.DataFrame(imputer.transform(X), columns=available)
+    X_scaled  = scaler.transform(X_imputed)
 
     scores                = clf.predict_proba(X_scaled)[:, 1]
     df["score"]           = scores

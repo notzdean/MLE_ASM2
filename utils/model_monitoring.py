@@ -1,7 +1,8 @@
 """
 Model monitoring: computes performance (AUC, Gini, KS), score stability (PSI),
-and covariate stability (CSI per top feature) across monthly prediction
-cohorts. Writes a monitoring parquet and PNG charts to datamart/gold/monitoring/.
+covariate stability (CSI per top feature), and label drift (default rate per
+cohort) across monthly prediction cohorts. Writes a monitoring parquet and
+PNG charts to datamart/gold/monitoring/.
 
 Stability thresholds (PSI / CSI):
   < 0.10  → stable (green)
@@ -12,6 +13,7 @@ Stability thresholds (PSI / CSI):
 import glob
 import json
 import os
+from datetime import datetime
 
 import matplotlib
 matplotlib.use("Agg")   # headless — no display needed in Docker
@@ -41,11 +43,8 @@ def _ks(y_true, y_score):
 
 
 def _psi(expected: np.ndarray, actual: np.ndarray, n_bins: int = 10) -> float:
-    """
-    Population Stability Index.
-    Uses equal-width bins [0, 1] for score PSI, or decile bins for feature PSI.
-    """
-    bins = np.linspace(0, 1, n_bins + 1)
+    """Population Stability Index using equal-width bins [0, 1]."""
+    bins    = np.linspace(0, 1, n_bins + 1)
     exp_pct = np.histogram(np.clip(expected, 0, 1), bins=bins)[0] / max(len(expected), 1)
     act_pct = np.histogram(np.clip(actual,   0, 1), bins=bins)[0] / max(len(actual),   1)
     exp_pct = np.clip(exp_pct, 1e-6, None)
@@ -55,13 +54,10 @@ def _psi(expected: np.ndarray, actual: np.ndarray, n_bins: int = 10) -> float:
 
 def _feature_psi(baseline_values: np.ndarray, current_values: np.ndarray,
                  n_bins: int = 10) -> float:
-    """
-    PSI for a continuous feature using quantile-based bins derived from baseline.
-    More robust than equal-width bins for skewed distributions.
-    """
+    """PSI for a continuous feature using quantile-based bins from baseline."""
     quantiles  = np.linspace(0, 100, n_bins + 1)
     bin_edges  = np.percentile(baseline_values, quantiles)
-    bin_edges  = np.unique(bin_edges)   # deduplicate in case of ties
+    bin_edges  = np.unique(bin_edges)
     if len(bin_edges) < 3:
         return 0.0
 
@@ -80,6 +76,42 @@ def _psi_flag(val: float) -> str:
     if val < 0.25:
         return "drift"
     return "retrain"
+
+
+# ---------------------------------------------------------------------------
+# Alert helpers
+# ---------------------------------------------------------------------------
+
+def _write_alert(monitoring_dir: str, snapshot_date_str: str, alerts: list):
+    """
+    Append PSI / CSI breach alerts to alerts.log and overwrite latest_alert.json.
+    Each breach line: ISO timestamp | snapshot_date | type | value | flag
+    """
+    if not alerts:
+        return
+
+    log_path   = os.path.join(monitoring_dir, "alerts.log")
+    json_path  = os.path.join(monitoring_dir, "latest_alert.json")
+    ts         = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+
+    with open(log_path, "a") as f:
+        for alert in alerts:
+            line = (
+                f"{ts} | {snapshot_date_str} | {alert['type']} | "
+                f"value={alert['value']:.4f} | flag={alert['flag']} | "
+                f"feature={alert.get('feature', 'score')}\n"
+            )
+            f.write(line)
+            print(f"[monitoring] ALERT: {line.strip()}")
+
+    latest = {
+        "timestamp":     ts,
+        "snapshot_date": snapshot_date_str,
+        "n_alerts":      len(alerts),
+        "alerts":        alerts,
+    }
+    with open(json_path, "w") as f:
+        json.dump(latest, f, indent=2)
 
 
 # ---------------------------------------------------------------------------
@@ -105,8 +137,8 @@ def run_monitoring(
         metadata = json.load(f)
 
     # PSI baseline: reconstruct approximate score distribution from saved percentiles
-    train_dist     = metadata.get("train_score_distribution", {})
-    baseline_pcts  = train_dist.get("percentiles", {})
+    train_dist      = metadata.get("train_score_distribution", {})
+    baseline_pcts   = train_dist.get("percentiles", {})
     baseline_scores = np.array([float(v) for v in baseline_pcts.values()])
 
     # CSI baseline: feature mean/std from training split
@@ -136,23 +168,25 @@ def run_monitoring(
         # --- Score PSI ---
         psi_score = _psi(baseline_scores, scores) if len(baseline_scores) > 0 else np.nan
 
-        # --- Performance metrics (need ground truth) ---
-        # Loans originated at pred_date → labels in label store at pred_date + 6 months
+        # --- Performance metrics + label drift (need ground truth) ---
         label_date     = pred_date + relativedelta(months=6)
         label_date_tag = label_date.strftime("%Y_%m_%d")
         label_file     = os.path.join(
             gold_label_store_dir, f"gold_label_store_{label_date_tag}.parquet"
         )
         auc = gini = ks = np.nan
+        default_rate = np.nan
         if os.path.exists(label_file):
             labels = pd.read_parquet(label_file)[["Customer_ID", "label"]]
             joined = preds.merge(labels, on="Customer_ID", how="inner")
-            if len(joined) >= 10 and joined["label"].nunique() > 1:
-                y_true = joined["label"].values
-                y_prob = joined["score"].values
-                auc    = float(roc_auc_score(y_true, y_prob))
-                gini   = _gini(y_true, pd.Series(y_prob))
-                ks     = _ks(y_true, y_prob)
+            if len(joined) >= 10:
+                default_rate = float(joined["label"].mean())
+                if joined["label"].nunique() > 1:
+                    y_true = joined["label"].values
+                    y_prob = joined["score"].values
+                    auc    = float(roc_auc_score(y_true, y_prob))
+                    gini   = _gini(y_true, pd.Series(y_prob))
+                    ks     = _ks(y_true, y_prob)
 
         # --- CSI: feature PSI for top features ---
         csi_row = {}
@@ -167,7 +201,6 @@ def run_monitoring(
                     continue
                 baseline_stat  = feature_baseline[feat]
                 current_vals   = feat_df[feat].dropna().values
-                # Reconstruct baseline distribution from p25/mean/p75 stats
                 baseline_approx = np.array([
                     baseline_stat["p25"],
                     baseline_stat["mean"],
@@ -186,6 +219,7 @@ def run_monitoring(
             "auc":            auc,
             "gini":           gini,
             "ks":             ks,
+            "default_rate":   default_rate,   # label drift tracking
             **csi_row,
         }
         monitoring_rows.append(row)
@@ -196,9 +230,30 @@ def run_monitoring(
         print(
             f"[monitoring] {pred_date_str}  "
             f"PSI={psi_score:.4f} ({_psi_flag(psi_score)})  "
-            f"AUC={f'{auc:.4f}' if not np.isnan(auc) else 'N/A'}"
+            f"AUC={f'{auc:.4f}' if not np.isnan(auc) else 'N/A'}  "
+            f"DefaultRate={f'{default_rate:.3f}' if not np.isnan(default_rate) else 'N/A'}"
             f"{csi_summary}"
         )
+
+        # --- PSI / CSI breach alerts ---
+        breach_alerts = []
+        if not np.isnan(psi_score) and psi_score > 0.25:
+            breach_alerts.append({
+                "type":    "PSI_BREACH",
+                "feature": "score",
+                "value":   round(float(psi_score), 6),
+                "flag":    "retrain",
+            })
+        for csi_key, csi_val in csi_row.items():
+            if csi_val > 0.25:
+                breach_alerts.append({
+                    "type":    "CSI_BREACH",
+                    "feature": csi_key.replace("csi_", ""),
+                    "value":   round(float(csi_val), 6),
+                    "flag":    "retrain",
+                })
+        if breach_alerts:
+            _write_alert(monitoring_dir, pred_date_str, breach_alerts)
 
     if not monitoring_rows:
         return
@@ -215,6 +270,7 @@ def run_monitoring(
     _plot_psi(monitor_df, monitoring_dir)
     _plot_score_distribution(pred_files, monitoring_dir)
     _plot_csi(monitor_df, top_features, monitoring_dir)
+    _plot_label_drift(monitor_df, monitoring_dir)
 
 
 # ---------------------------------------------------------------------------
@@ -299,7 +355,7 @@ def _plot_psi(df: pd.DataFrame, out_dir: str):
 
 def _plot_score_distribution(pred_files: list, out_dir: str):
     """Overlaid predicted score distributions per cohort — shows drift visually."""
-    files_to_plot = pred_files[-12:]   # last 12 months for readability
+    files_to_plot = pred_files[-12:]
     if not files_to_plot:
         return
 
@@ -346,7 +402,7 @@ def _plot_csi(df: pd.DataFrame, top_features: list, out_dir: str):
     if not csi_cols:
         return
 
-    dates = pd.to_datetime(df["snapshot_date"])
+    dates   = pd.to_datetime(df["snapshot_date"])
     n_feats = len(csi_cols)
     fig, axes = plt.subplots(
         n_feats, 1, figsize=(12, max(3 * n_feats, 6)), sharex=True
@@ -374,6 +430,49 @@ def _plot_csi(df: pd.DataFrame, top_features: list, out_dir: str):
     axes[-1].set_xlabel("Origination Month", fontsize=10)
     plt.tight_layout()
     path = os.path.join(out_dir, "csi_over_time.png")
+    plt.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"[monitoring] plot → {path}")
+
+
+def _plot_label_drift(df: pd.DataFrame, out_dir: str):
+    """
+    Default rate per cohort over time — label drift monitoring.
+    Only plotted for cohorts where ground truth labels are available.
+    """
+    labelled = df.dropna(subset=["default_rate"])
+    if labelled.empty:
+        print("[monitoring] no labeled cohorts yet — skipping label drift plot")
+        return
+
+    dates        = pd.to_datetime(labelled["snapshot_date"])
+    default_rate = labelled["default_rate"]
+
+    # Compute overall mean as reference baseline
+    baseline_rate = float(default_rate.mean())
+
+    fig, ax = plt.subplots(figsize=(12, 5))
+    fig.suptitle("Label Drift — Default Rate Per Origination Cohort",
+                 fontsize=14, fontweight="bold")
+
+    ax.bar(dates, default_rate, color="#9C27B0", width=20, alpha=0.75, zorder=3,
+           label="Cohort default rate")
+    ax.axhline(baseline_rate, color="#333333", linestyle="--", linewidth=1.5,
+               label=f"Mean default rate ({baseline_rate:.2%})")
+    ax.axhline(baseline_rate * 1.20, color="#FF9800", linestyle=":", linewidth=1.2,
+               label="+20% band (monitor)")
+    ax.axhline(baseline_rate * 1.40, color="#F44336", linestyle=":", linewidth=1.2,
+               label="+40% band (investigate)")
+
+    ax.set_xlabel("Origination Month (Feature Snapshot Date)", fontsize=10)
+    ax.set_ylabel("Default Rate", fontsize=11)
+    ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda y, _: f"{y:.1%}"))
+    ax.legend(fontsize=9)
+    ax.grid(axis="y", alpha=0.3, zorder=0)
+    ax.tick_params(axis="x", rotation=45)
+
+    plt.tight_layout()
+    path = os.path.join(out_dir, "label_drift_over_time.png")
     plt.savefig(path, dpi=150, bbox_inches="tight")
     plt.close()
     print(f"[monitoring] plot → {path}")

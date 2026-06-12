@@ -1,7 +1,8 @@
 """
 Model training: joins feature store + label store, 3-way temporal split
-(train / test / OOT), RandomizedSearchCV tuning on XGBoost, picks best
-champion by OOT AUC, saves versioned artifact to model_store/.
+(train / test / OOT), engineers ratio features, RandomizedSearchCV tuning
+on XGBoost, calibrates champion probabilities, picks best champion by OOT
+AUC, saves versioned artifact and comparison CSV to model_store/.
 
 Temporal split (no shuffle — prevents data leakage):
   Train : feature_snapshot_date <= TRAIN_END_DATE   (Jan 2023 – Dec 2023)
@@ -9,9 +10,10 @@ Temporal split (no shuffle — prevents data leakage):
   OOT   : date > TEST_END_DATE                       (Apr 2024 – Jun 2024)
 """
 
-import os
+import csv
 import glob
 import json
+import os
 import pickle
 import shutil
 from datetime import datetime
@@ -20,12 +22,12 @@ import numpy as np
 import pandas as pd
 from dateutil.relativedelta import relativedelta
 from scipy.stats import ks_2samp
+from sklearn.calibration import CalibratedClassifierCV
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import roc_auc_score, make_scorer
 from sklearn.model_selection import RandomizedSearchCV
-from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 import xgboost as xgb
 
@@ -33,6 +35,7 @@ import xgboost as xgb
 TRAIN_END_DATE = "2023-12-01"   # last training month (inclusive)
 TEST_END_DATE  = "2024-03-01"   # last test month (inclusive); after this = OOT
 TOP_N_FEATURES = 10             # features tracked for CSI baseline
+CSI_DRIFT_THRESHOLD = 0.25      # exclude features with max CSI above this
 
 # All ML-ready columns produced by the gold feature store
 FEATURE_COLS = (
@@ -49,8 +52,26 @@ FEATURE_COLS = (
         "Payment_of_Min_Amount", "Total_EMI_per_month",
         "Amount_invested_monthly", "Payment_Behaviour",
         "Monthly_Balance",                      # financials (22)
+        # Engineered ratio features (added at training time — not in gold store)
+        "debt_to_income", "emi_to_salary", "debt_per_loan",
     ]
 )
+
+
+# ---------------------------------------------------------------------------
+# Feature engineering (applied at training and inference time)
+# ---------------------------------------------------------------------------
+
+def _engineer_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Add domain-driven ratio features.  Applied after loading, before split —
+    never leaks future data since all inputs are available at origination time.
+    """
+    df = df.copy()
+    df["debt_to_income"] = df["Outstanding_Debt"] / df["Annual_Income"].clip(lower=1)
+    df["emi_to_salary"]  = df["Total_EMI_per_month"] / df["Monthly_Inhand_Salary"].clip(lower=1)
+    df["debt_per_loan"]  = df["Outstanding_Debt"] / df["Num_of_Loan"].clip(lower=1)
+    return df
 
 
 # ---------------------------------------------------------------------------
@@ -67,6 +88,33 @@ def _eval_metrics(y_true, y_score):
     neg  = y_score[y_true == 0]
     ks   = float(ks_2samp(pos, neg)[0]) if (len(pos) > 0 and len(neg) > 0) else None
     return {"auc": auc, "gini": gini, "ks": ks}
+
+
+# ---------------------------------------------------------------------------
+# Drift-aware feature exclusion
+# ---------------------------------------------------------------------------
+
+def _get_drifted_features(monitoring_dir: str) -> list:
+    """
+    Load the latest monitoring parquet and return feature names whose max CSI
+    exceeds CSI_DRIFT_THRESHOLD.  Returns empty list if no monitoring data.
+    """
+    if not monitoring_dir or not os.path.isdir(monitoring_dir):
+        return []
+
+    mon_files = sorted(glob.glob(os.path.join(monitoring_dir, "monitoring_*.parquet")))
+    if not mon_files:
+        return []
+
+    latest = pd.read_parquet(mon_files[-1])
+    csi_cols = [c for c in latest.columns if c.startswith("csi_")]
+    drifted = []
+    for col in csi_cols:
+        feat = col.replace("csi_", "")
+        if latest[col].max() > CSI_DRIFT_THRESHOLD:
+            drifted.append(feat)
+            print(f"[training] drift-aware exclusion: {feat} (max CSI={latest[col].max():.4f})")
+    return drifted
 
 
 # ---------------------------------------------------------------------------
@@ -122,8 +170,9 @@ def train_models(
     gold_feature_store_dir: str,
     gold_label_store_dir: str,
     model_store_dir: str,
-    train_end_date: str = TRAIN_END_DATE,
-    test_end_date: str  = TEST_END_DATE,
+    train_end_date: str  = TRAIN_END_DATE,
+    test_end_date: str   = TEST_END_DATE,
+    monitoring_dir: str  = None,
 ):
     print("[training] loading labeled dataset ...")
     df = _load_labeled_dataset(gold_feature_store_dir, gold_label_store_dir)
@@ -132,9 +181,20 @@ def train_models(
         print("[training] no labeled data available yet — skipping")
         return None
 
+    # Engineer ratio features before split (no leakage — all inputs from origination)
+    df = _engineer_features(df)
+
     df["label"]                 = df["label"].astype(int)
     df["feature_snapshot_date"] = pd.to_datetime(df["feature_snapshot_date"])
-    available_features          = [c for c in FEATURE_COLS if c in df.columns]
+
+    # Drift-aware feature exclusion: drop features with CSI > threshold
+    drifted_features    = _get_drifted_features(monitoring_dir)
+    candidate_features  = [c for c in FEATURE_COLS if c not in drifted_features]
+    available_features  = [c for c in candidate_features if c in df.columns]
+
+    if drifted_features:
+        print(f"[training] excluded {len(drifted_features)} drifted features: {drifted_features}")
+    print(f"[training] using {len(available_features)} features")
 
     # 3-way temporal split
     train_df = df[df["feature_snapshot_date"] <= train_end_date]
@@ -169,7 +229,8 @@ def train_models(
     imputer.fit(X_train)
     X_train_imp = pd.DataFrame(imputer.transform(X_train), columns=available_features)
     X_test_imp  = pd.DataFrame(imputer.transform(X_test),  columns=available_features)
-    X_oot_imp   = pd.DataFrame(imputer.transform(X_oot),   columns=available_features) if not X_oot.empty else pd.DataFrame()
+    X_oot_imp   = (pd.DataFrame(imputer.transform(X_oot), columns=available_features)
+                   if not X_oot.empty else pd.DataFrame())
 
     # Scaler fitted on training data
     scaler = StandardScaler()
@@ -202,15 +263,15 @@ def train_models(
         scale_pos_weight=(y_train == 0).sum() / max((y_train == 1).sum(), 1),
     )
     param_dist = {
-        "n_estimators":    [25, 50, 100, 200],
-        "max_depth":       [2, 3, 4],
-        "learning_rate":   [0.01, 0.05, 0.1],
-        "subsample":       [0.6, 0.8, 1.0],
-        "colsample_bytree":[0.6, 0.8, 1.0],
-        "gamma":           [0, 0.1, 0.2],
-        "min_child_weight":[1, 3, 5],
-        "reg_alpha":       [0, 0.1, 1.0],
-        "reg_lambda":      [1.0, 1.5, 2.0],
+        "n_estimators":     [25, 50, 100, 200],
+        "max_depth":        [2, 3, 4],
+        "learning_rate":    [0.01, 0.05, 0.1],
+        "subsample":        [0.6, 0.8, 1.0],
+        "colsample_bytree": [0.6, 0.8, 1.0],
+        "gamma":            [0, 0.1, 0.2],
+        "min_child_weight": [1, 3, 5],
+        "reg_alpha":        [0, 0.1, 1.0],
+        "reg_lambda":       [1.0, 1.5, 2.0],
     }
     auc_scorer = make_scorer(roc_auc_score, needs_proba=True)
     rscv = RandomizedSearchCV(
@@ -238,8 +299,8 @@ def train_models(
 
         m_train = _eval_metrics(y_train, pd.Series(train_prob))
         m_test  = _eval_metrics(y_test,  pd.Series(test_prob))
-        m_oot   = _eval_metrics(y_oot, pd.Series(clf.predict_proba(X_oot_sc)[:, 1])) \
-                  if len(X_oot_sc) > 0 else {"auc": None, "gini": None, "ks": None}
+        m_oot   = (_eval_metrics(y_oot, pd.Series(clf.predict_proba(X_oot_sc)[:, 1]))
+                   if len(X_oot_sc) > 0 else {"auc": None, "gini": None, "ks": None})
 
         results[name] = {
             "train": m_train, "test": m_test, "oot": m_oot,
@@ -262,6 +323,51 @@ def train_models(
     print(f"[training] champion: {champion_name}  OOT AUC={_score(champion_name):.4f}")
 
     # ------------------------------------------------------------------
+    # Model calibration — Platt scaling (sigmoid) or isotonic regression
+    # Calibrate on test set (prefit champion, use test as calibration set)
+    # ------------------------------------------------------------------
+    cal_method  = "isotonic" if len(X_test_sc) > 1000 else "sigmoid"
+    calibrated  = CalibratedClassifierCV(champion["clf"], cv="prefit", method=cal_method)
+    calibrated.fit(X_test_sc, y_test)
+    print(f"[training] calibrated champion with {cal_method} on {len(X_test_sc)} test samples")
+
+    # Re-evaluate calibrated model on OOT to confirm no degradation
+    cal_oot = (_eval_metrics(y_oot, pd.Series(calibrated.predict_proba(X_oot_sc)[:, 1]))
+               if len(X_oot_sc) > 0 else {"auc": None, "gini": None, "ks": None})
+    print(
+        f"[training] calibrated OOT AUC={cal_oot['auc']:.4f if cal_oot['auc'] else 'N/A'}"
+    )
+
+    # ------------------------------------------------------------------
+    # Model comparison CSV — all three models on all three splits
+    # ------------------------------------------------------------------
+    version_tag   = datetime.now().strftime("%Y_%m_%d")
+    model_version = f"credit_model_{version_tag}"
+
+    os.makedirs(model_store_dir, exist_ok=True)
+    comparison_path = os.path.join(model_store_dir, f"model_comparison_{version_tag}.csv")
+    comparison_rows = []
+    for name, r in results.items():
+        for split in ("train", "test", "oot"):
+            m = r[split]
+            comparison_rows.append({
+                "model":         name,
+                "split":         split,
+                "auc":           m["auc"],
+                "gini":          m["gini"],
+                "ks":            m["ks"],
+                "champion":      (name == champion_name),
+                "model_version": model_version,
+                "train_date":    datetime.now().isoformat(),
+            })
+
+    with open(comparison_path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=comparison_rows[0].keys())
+        writer.writeheader()
+        writer.writerows(comparison_rows)
+    print(f"[training] comparison → {comparison_path}")
+
+    # ------------------------------------------------------------------
     # Feature importance from XGBoost (for CSI baseline in monitoring)
     # ------------------------------------------------------------------
     xgb_importances = {}
@@ -270,12 +376,12 @@ def train_models(
         xgb_importances = dict(
             sorted(
                 zip(available_features, importances.tolist()),
-                key=lambda x: x[1], reverse=True
+                key=lambda x: x[1], reverse=True,
             )[:TOP_N_FEATURES]
         )
 
-    # Training score distribution — PSI baseline
-    train_scores = champion["clf"].predict_proba(X_train_sc)[:, 1]
+    # Training score distribution — PSI baseline (use calibrated scores)
+    train_scores = calibrated.predict_proba(X_train_sc)[:, 1]
     pct_keys     = [10, 20, 30, 40, 50, 60, 70, 80, 90]
 
     # Feature baseline stats for CSI (mean + std of top features on training data)
@@ -294,13 +400,16 @@ def train_models(
     # ------------------------------------------------------------------
     # Build and persist artifact
     # ------------------------------------------------------------------
-    version_tag   = datetime.now().strftime("%Y_%m_%d")
-    model_version = f"credit_model_{version_tag}"
-
     artifact = {
         "model_name":    champion_name,
         "model_version": model_version,
         "train_date":    datetime.now().isoformat(),
+        "calibration": {
+            "method":           cal_method,
+            "calibration_set":  "test",
+            "n_calibration":    len(X_test_sc),
+        },
+        "drift_aware_exclusions": drifted_features,
         "data_dates": {
             "train_start": str(train_df["feature_snapshot_date"].min().date()),
             "train_end":   train_end_date,
@@ -310,19 +419,20 @@ def train_models(
             "oot_end":     str(oot_df["feature_snapshot_date"].max().date()) if len(oot_df) else None,
         },
         "data_stats": {
-            "n_train":               len(X_train),
-            "n_test":                len(X_test),
-            "n_oot":                 len(X_oot),
+            "n_train":                len(X_train),
+            "n_test":                 len(X_test),
+            "n_oot":                  len(X_oot),
             "label_prevalence_train": float(y_train.mean()),
             "label_prevalence_test":  float(y_test.mean()) if len(y_test) else None,
             "label_prevalence_oot":   float(y_oot.mean())  if len(y_oot)  else None,
         },
-        "features": available_features,
+        "features":                   available_features,
         "top_features_by_importance": xgb_importances,
         "metrics": {
             name: {"train": r["train"], "test": r["test"], "oot": r["oot"]}
             for name, r in results.items()
         },
+        "calibrated_oot_metrics": cal_oot,
         "hp_params": best_hp,
         "train_score_distribution": {
             "mean":        float(train_scores.mean()),
@@ -336,16 +446,15 @@ def train_models(
         },
     }
 
-    # Bundle model + preprocessors so inference applies same transforms
+    # Bundle: calibrated model + preprocessors so inference applies same transforms
     model_bundle = {
-        "pipeline":  champion["clf"],
+        "pipeline":  calibrated,
         "imputer":   imputer,
         "scaler":    scaler,
         "features":  available_features,
         "metadata":  artifact,
     }
 
-    os.makedirs(model_store_dir, exist_ok=True)
     champion_path  = os.path.join(model_store_dir, "champion_model.pkl")
     versioned_path = os.path.join(model_store_dir, f"{model_version}.pkl")
     meta_path      = os.path.join(model_store_dir, "model_metadata.json")
