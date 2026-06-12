@@ -1,6 +1,7 @@
 """
-Model inference: loads champion model, scores the feature snapshot for a given
-month, and writes predictions to datamart/gold/predictions/.
+Model inference: loads champion model bundle, applies the same imputer +
+scaler used during training, scores the feature snapshot for a given month,
+and writes predictions to datamart/gold/predictions/.
 """
 
 import json
@@ -16,25 +17,29 @@ def run_inference(
     predictions_dir: str,
     model_store_dir: str,
 ):
-    model_path = os.path.join(model_store_dir, "champion_model.pkl")
-    meta_path  = os.path.join(model_store_dir, "model_metadata.json")
+    champion_path = os.path.join(model_store_dir, "champion_model.pkl")
+    meta_path     = os.path.join(model_store_dir, "model_metadata.json")
 
-    if not os.path.exists(model_path):
+    if not os.path.exists(champion_path):
         print(f"[inference] no champion model found — skipping {snapshot_date_str}")
         return
 
-    with open(model_path, "rb") as f:
-        model = pickle.load(f)
-    with open(meta_path, "r") as f:
+    with open(champion_path, "rb") as f:
+        bundle = pickle.load(f)
+    with open(meta_path) as f:
         metadata = json.load(f)
 
-    feature_cols = metadata["features"]
-    model_name   = metadata["model_name"]
+    clf           = bundle["pipeline"]
+    imputer       = bundle["imputer"]
+    scaler        = bundle["scaler"]
+    feature_cols  = bundle["features"]
+    model_version = metadata.get("model_version", "unknown")
 
     # Load feature store partition for this snapshot month
-    date_tag      = snapshot_date_str.replace("-", "_")
-    feature_file  = os.path.join(gold_feature_store_dir, f"gold_feature_store_{date_tag}.parquet")
-
+    date_tag     = snapshot_date_str.replace("-", "_")
+    feature_file = os.path.join(
+        gold_feature_store_dir, f"gold_feature_store_{date_tag}.parquet"
+    )
     if not os.path.exists(feature_file):
         print(f"[inference] feature file missing for {snapshot_date_str} — skipping")
         return
@@ -42,15 +47,20 @@ def run_inference(
     df = pd.read_parquet(feature_file)
     available = [c for c in feature_cols if c in df.columns]
 
-    scores                  = model.predict_proba(df[available])[:, 1]
-    df["score"]             = scores
-    df["predicted_label"]   = (scores >= 0.5).astype(int)
-    df["snapshot_date"]     = snapshot_date_str
-    df["model_name"]        = model_name
+    # Apply same preprocessing as training
+    X           = df[available]
+    X_imputed   = pd.DataFrame(imputer.transform(X),   columns=available)
+    X_scaled    = scaler.transform(X_imputed)
+
+    scores                = clf.predict_proba(X_scaled)[:, 1]
+    df["score"]           = scores
+    df["predicted_label"] = (scores >= 0.5).astype(int)
+    df["snapshot_date"]   = snapshot_date_str
+    df["model_version"]   = model_version
 
     os.makedirs(predictions_dir, exist_ok=True)
     out_path = os.path.join(predictions_dir, f"predictions_{date_tag}.parquet")
-    df[["Customer_ID", "snapshot_date", "score", "predicted_label", "model_name"]].to_parquet(
+    df[["Customer_ID", "snapshot_date", "score", "predicted_label", "model_version"]].to_parquet(
         out_path, index=False
     )
     print(f"[inference] {snapshot_date_str} — {len(df)} rows → {out_path}")
