@@ -385,7 +385,7 @@ def _run_training_pipeline(
 
     top_features           = list(xgb_importances.keys()) if xgb_importances else available_features[:TOP_N_FEATURES]
     train_scores           = calibrated.predict_proba(X_train_sc)[:, 1]
-    pct_keys               = [10, 20, 30, 40, 50, 60, 70, 80, 90]
+    pct_keys               = list(range(1, 100))   # p1–p99 for high-resolution PSI baseline
     feature_baseline_stats = {}
     for feat in top_features:
         if feat in X_train_imp.columns:
@@ -393,8 +393,10 @@ def _run_training_pipeline(
             feature_baseline_stats[feat] = {
                 "mean": float(col_vals.mean()),
                 "std":  float(col_vals.std()),
-                "p25":  float(col_vals.quantile(0.25)),
-                "p75":  float(col_vals.quantile(0.75)),
+                "percentiles": {
+                    str(p): float(col_vals.quantile(p / 100))
+                    for p in range(0, 101, 10)
+                },
             }
 
     # --- Build artifact ---

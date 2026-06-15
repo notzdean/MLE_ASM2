@@ -3,6 +3,10 @@ datamart/
 model_store/
 logs/
 CLAUDE.md
+A1/
+.claude/ 
+data/ 
+
 
 # Python
 __pycache__/

@@ -106,7 +106,8 @@ def run_inference(
         with open(challenger_path, "rb") as f:
             challenger_bundle = pickle.load(f)
 
-        df["challenger_score"] = _score_bundle(challenger_bundle, df)
+        df["challenger_score"]           = _score_bundle(challenger_bundle, df)
+        df["challenger_predicted_label"] = (df["challenger_score"] >= 0.5).astype(int)
 
         ch_version = "unknown"
         if os.path.exists(challenger_meta):
@@ -126,7 +127,7 @@ def run_inference(
     os.makedirs(predictions_dir, exist_ok=True)
     save_cols = ["Customer_ID", "snapshot_date", "score", "predicted_label", "model_version"]
     if "challenger_score" in df.columns:
-        save_cols += ["challenger_score", "challenger_model_version"]
+        save_cols += ["challenger_score", "challenger_predicted_label", "challenger_model_version"]
 
     out_path = os.path.join(predictions_dir, f"predictions_{date_tag}.parquet")
     df[save_cols].to_parquet(out_path, index=False)

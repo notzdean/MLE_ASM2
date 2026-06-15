@@ -1,12 +1,8 @@
 import os
-from itertools import chain
-import pyspark.sql.functions as F
-from pyspark.sql.functions import col, create_map, lit
-from pyspark.sql.types import IntegerType
-from pyspark.sql.window import Window
 
+import pandas as pd
 
-# Label-encoding maps for categorical columns
+# Label-encoding maps for categorical columns (identical to original PySpark version)
 _OCCUPATION_MAP = {
     "Accountant": 0, "Architect": 1, "Developer": 2, "Doctor": 3,
     "Engineer": 4, "Entrepreneur": 5, "Journalist": 6, "Lawyer": 7,
@@ -29,28 +25,28 @@ _BEHAVIOUR_MAP = {
 }
 
 
-def _make_mapping_expr(mapping: dict, col_name: str):
-    """Build a create_map expression from a Python dict for label encoding."""
-    kv_literals = [lit(x) for x in chain(*mapping.items())]
-    return create_map(kv_literals)[col(col_name)].cast(IntegerType())
-
-
 def process_features_gold_table(
     snapshot_date_str,
     silver_clickstream_dir,
     silver_attributes_dir,
     silver_financials_dir,
     gold_dir,
-    spark,
+    spark=None,   # unused — kept for API compatibility with the DAG call
 ):
     """
     Join monthly clickstream features with static attributes and financials,
     apply categorical encoding, and save as gold feature store partition.
 
-    Attributes and financials are treated as customer-level reference tables
-    (one record per customer regardless of snapshot_date) and joined only on
-    Customer_ID to avoid dropping customers due to date misalignment.
+    Rewritten from PySpark to pandas to avoid TaskResultLost OOM in Docker.
+    Output schema and file names are identical to the original implementation.
     """
+    partition_name = "gold_feature_store_" + snapshot_date_str.replace("-", "_") + ".parquet"
+    filepath_out   = gold_dir + partition_name
+
+    if os.path.exists(filepath_out):
+        print(f"[gold feature store] {snapshot_date_str} already exists, skipping")
+        return None
+
     clickstream_path = (
         silver_clickstream_dir
         + "silver_clickstream_"
@@ -61,43 +57,43 @@ def process_features_gold_table(
         print(f"[gold feature store] missing clickstream silver for {snapshot_date_str}, skipping")
         return None
 
-    df = spark.read.parquet(clickstream_path)
+    df = pd.read_parquet(clickstream_path)
 
-    # Join attributes: use the most recent record per customer whose snapshot_date
-    # is <= the feature partition date, preventing future data leaking into earlier partitions.
+    cutoff = pd.Timestamp(snapshot_date_str)
+
+    # Join attributes: most recent record per customer where snapshot_date <= partition date
     attributes_path = silver_attributes_dir + "silver_attributes.parquet"
     if os.path.exists(attributes_path):
-        attrs = spark.read.parquet(attributes_path)
-        attrs = attrs.filter(col("snapshot_date") <= snapshot_date_str)
-        w = Window.partitionBy("Customer_ID").orderBy(col("snapshot_date").desc())
-        attrs = attrs.withColumn("_rn", F.row_number().over(w)) \
-                     .filter(col("_rn") == 1).drop("_rn", "snapshot_date")
-        df = df.join(attrs, on="Customer_ID", how="left")
+        attrs = pd.read_parquet(attributes_path)
+        attrs["snapshot_date"] = pd.to_datetime(attrs["snapshot_date"])
+        attrs = attrs[attrs["snapshot_date"] <= cutoff]
+        attrs = (
+            attrs.sort_values("snapshot_date", ascending=False)
+                 .drop_duplicates(subset="Customer_ID", keep="first")
+                 .drop(columns=["snapshot_date"])
+        )
+        df = df.merge(attrs, on="Customer_ID", how="left")
 
-    # Join financials: same temporal-safe logic as attributes above.
+    # Join financials: same temporal-safe logic as attributes
     financials_path = silver_financials_dir + "silver_financials.parquet"
     if os.path.exists(financials_path):
-        fins = spark.read.parquet(financials_path)
-        fins = fins.filter(col("snapshot_date") <= snapshot_date_str)
-        w = Window.partitionBy("Customer_ID").orderBy(col("snapshot_date").desc())
-        fins = fins.withColumn("_rn", F.row_number().over(w)) \
-                   .filter(col("_rn") == 1).drop("_rn", "snapshot_date")
-        df = df.join(fins, on="Customer_ID", how="left")
+        fins = pd.read_parquet(financials_path)
+        fins["snapshot_date"] = pd.to_datetime(fins["snapshot_date"])
+        fins = fins[fins["snapshot_date"] <= cutoff]
+        fins = (
+            fins.sort_values("snapshot_date", ascending=False)
+                .drop_duplicates(subset="Customer_ID", keep="first")
+                .drop(columns=["snapshot_date"])
+        )
+        df = df.merge(fins, on="Customer_ID", how="left")
 
-    # --- Categorical encoding (string → integer) for ML compatibility ---
+    # Categorical encoding (string → integer) for ML compatibility
+    df["Occupation"]            = df["Occupation"].map(_OCCUPATION_MAP)
+    df["Credit_Mix"]            = df["Credit_Mix"].map(_CREDIT_MIX_MAP)
+    df["Payment_of_Min_Amount"] = df["Payment_of_Min_Amount"].map(_PAYMENT_MIN_MAP)
+    df["Payment_Behaviour"]     = df["Payment_Behaviour"].map(_BEHAVIOUR_MAP)
 
-    df = df.withColumn("Occupation", _make_mapping_expr(_OCCUPATION_MAP, "Occupation"))
-    df = df.withColumn("Credit_Mix", _make_mapping_expr(_CREDIT_MIX_MAP, "Credit_Mix"))
-    df = df.withColumn("Payment_of_Min_Amount",
-                       _make_mapping_expr(_PAYMENT_MIN_MAP, "Payment_of_Min_Amount"))
-    df = df.withColumn("Payment_Behaviour",
-                       _make_mapping_expr(_BEHAVIOUR_MAP, "Payment_Behaviour"))
-
-    count = df.count()
-    partition_name = (
-        "gold_feature_store_" + snapshot_date_str.replace("-", "_") + ".parquet"
-    )
-    filepath_out = gold_dir + partition_name
-    df.write.mode("overwrite").parquet(filepath_out)
-    print(f"[gold feature store] {snapshot_date_str} row count: {count}, saved to: {filepath_out}")
+    os.makedirs(gold_dir, exist_ok=True)
+    df.to_parquet(filepath_out, index=False)
+    print(f"[gold feature store] {snapshot_date_str} row count: {len(df)}, saved to: {filepath_out}")
     return df

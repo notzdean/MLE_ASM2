@@ -207,9 +207,11 @@ def run_monitoring(
         print("[monitoring] no prediction files found — skipping")
         return
 
+    ROLLING_WINDOW = 3   # number of prior months used as PSI rolling baseline
+
     monitoring_rows = []
 
-    for pf in pred_files:
+    for idx, pf in enumerate(pred_files):
         basename      = os.path.basename(pf)
         date_tag      = basename.replace("predictions_", "").replace(".parquet", "")
         pred_date     = pd.Timestamp(date_tag.replace("_", "-"))
@@ -219,14 +221,31 @@ def run_monitoring(
         if preds.empty or "score" not in preds.columns:
             continue
 
-        scores    = preds["score"].dropna().values
-        psi_score = _psi(baseline_scores, scores) if len(baseline_scores) > 0 else np.nan
+        scores = preds["score"].dropna().values
+
+        # Rolling PSI: compare current month vs previous ROLLING_WINDOW months of inference.
+        # This measures "is the model drifting recently" rather than "does this month look
+        # like training time" — avoids structural red-PSI caused by MOB-6 vs training distribution.
+        if idx >= 1:
+            prior_files  = pred_files[max(0, idx - ROLLING_WINDOW):idx]
+            prior_scores = np.concatenate([
+                pd.read_parquet(p)["score"].dropna().values
+                for p in prior_files
+                if os.path.exists(p)
+            ])
+            psi_score = _psi(prior_scores, scores) if len(prior_scores) > 0 else np.nan
+        else:
+            psi_score = np.nan   # first month — no prior reference
+
+        # Also track training-baseline PSI as a secondary reference column
+        psi_vs_training = _psi(baseline_scores, scores) if len(baseline_scores) > 0 else np.nan
 
         # --- Performance + label drift (requires ground truth) ---
-        label_date     = pred_date + relativedelta(months=6)
-        label_date_tag = label_date.strftime("%Y_%m_%d")
-        label_file     = os.path.join(
-            gold_label_store_dir, f"gold_label_store_{label_date_tag}.parquet"
+        # Label store is dated by MEASUREMENT DATE = same as feature snapshot date.
+        # Predictions for Jul 2023 contain Jan 2023 cohort customers (scored at MOB 6),
+        # whose labels are in gold_label_store_2023_07_01.parquet — same date, not +6 months.
+        label_file = os.path.join(
+            gold_label_store_dir, f"gold_label_store_{date_tag}.parquet"
         )
         auc = gini = ks = default_rate = np.nan
         challenger_auc = np.nan
@@ -263,19 +282,34 @@ def run_monitoring(
                     continue
                 bstat        = feature_baseline[feat]
                 current_vals = feat_df[feat].dropna().values
-                baseline_approx = np.array(
-                    [bstat["p25"], bstat["mean"], bstat["p75"]]
-                    * max(len(current_vals) // 3, 1)
-                )
-                csi_row[f"csi_{feat}"] = round(_feature_psi(baseline_approx, current_vals), 6)
+                if "percentiles" in bstat:
+                    # Use stored decile bin edges: 10 equal-quantile training bins → expected = uniform
+                    pcts      = bstat["percentiles"]
+                    bin_edges = np.unique(np.array([float(pcts[str(p)]) for p in range(0, 101, 10)]))
+                    if len(bin_edges) >= 3:
+                        n_b     = len(bin_edges) - 1
+                        exp_pct = np.clip(np.full(n_b, 1.0 / n_b), 1e-6, None)
+                        act_cnt = np.histogram(current_vals, bins=bin_edges)[0]
+                        act_pct = np.clip(act_cnt / max(len(current_vals), 1), 1e-6, None)
+                        csi_val = float(np.sum((act_pct - exp_pct) * np.log(act_pct / exp_pct)))
+                    else:
+                        csi_val = 0.0
+                else:
+                    baseline_approx = np.array(
+                        [bstat.get("p25", 0), bstat.get("mean", 0), bstat.get("p75", 0)]
+                        * max(len(current_vals) // 3, 1)
+                    )
+                    csi_val = _feature_psi(baseline_approx, current_vals)
+                csi_row[f"csi_{feat}"] = round(csi_val, 6)
 
         row = {
-            "snapshot_date":   pred_date_str,
-            "n_predictions":   len(preds),
-            "mean_score":      float(scores.mean()),
-            "std_score":       float(scores.std()),
-            "psi_score":       psi_score,
-            "psi_flag":        _psi_flag(psi_score),
+            "snapshot_date":    pred_date_str,
+            "n_predictions":    len(preds),
+            "mean_score":       float(scores.mean()),
+            "std_score":        float(scores.std()),
+            "psi_score":        psi_score,           # rolling PSI (vs prior 3 months)
+            "psi_flag":         _psi_flag(psi_score),
+            "psi_vs_training":  psi_vs_training,     # vs training baseline (reference only)
             "auc":             auc,
             "gini":            gini,
             "ks":              ks,
@@ -296,9 +330,12 @@ def run_monitoring(
         csi_str = (
             f"  max_CSI={max(csi_row.values()):.4f}" if csi_row else ""
         )
+        psi_disp     = f"{psi_score:.4f}" if not np.isnan(psi_score) else "N/A (first month)"
+        psi_tr_disp  = f"{psi_vs_training:.4f}" if not np.isnan(psi_vs_training) else "N/A"
         print(
             f"[monitoring] {pred_date_str}  "
-            f"PSI={psi_score:.4f} ({_psi_flag(psi_score)})  "
+            f"PSI(rolling)={psi_disp} ({_psi_flag(psi_score)})  "
+            f"PSI(vs_training)={psi_tr_disp}  "
             f"AUC={f'{auc:.4f}' if not np.isnan(auc) else 'N/A'}  "
             f"DefaultRate={f'{default_rate:.3f}' if not np.isnan(default_rate) else 'N/A'}"
             f"{shadow_str}{csi_str}"
@@ -392,15 +429,15 @@ def _plot_psi(df: pd.DataFrame, out_dir: str):
     colours = ["#4CAF50" if v < 0.10 else ("#FF9800" if v < 0.25 else "#F44336") for v in psi]
 
     fig, ax = plt.subplots(figsize=(12, 5))
-    fig.suptitle("Score Distribution Stability (PSI) Over Time",
+    fig.suptitle("Score Distribution Stability — Rolling PSI (vs Prior 3 Months)",
                  fontsize=14, fontweight="bold")
-    ax.bar(dates, psi, color=colours, width=20, alpha=0.85, zorder=3)
+    ax.bar(dates, psi, color=colours, width=pd.Timedelta(days=20), alpha=0.85, zorder=3)
     ax.axhline(0.10, color="#FF9800", linestyle="--", linewidth=1.5,
                label="Moderate drift threshold (0.10)")
     ax.axhline(0.25, color="#F44336", linestyle="--", linewidth=1.5,
                label="Retrain trigger (0.25)")
     ax.set_xlabel("Origination Month", fontsize=10)
-    ax.set_ylabel("PSI", fontsize=11)
+    ax.set_ylabel("PSI (rolling)", fontsize=11)
     ax.grid(axis="y", alpha=0.3, zorder=0)
     ax.tick_params(axis="x", rotation=45)
     ax.legend(handles=[
@@ -466,7 +503,7 @@ def _plot_csi(df: pd.DataFrame, top_features: list, out_dir: str):
     for ax, col in zip(axes, csi_cols):
         vals    = df[col].fillna(0)
         colours = ["#4CAF50" if v < 0.10 else ("#FF9800" if v < 0.25 else "#F44336") for v in vals]
-        ax.bar(dates, vals, color=colours, width=20, alpha=0.85, zorder=3)
+        ax.bar(dates, vals, color=colours, width=pd.Timedelta(days=20), alpha=0.85, zorder=3)
         ax.axhline(0.10, color="#FF9800", linestyle="--", linewidth=1, alpha=0.8)
         ax.axhline(0.25, color="#F44336", linestyle="--", linewidth=1, alpha=0.8)
         ax.set_ylabel(col.replace("csi_", ""), fontsize=9)
@@ -494,7 +531,7 @@ def _plot_label_drift(df: pd.DataFrame, out_dir: str):
     fig, ax = plt.subplots(figsize=(12, 5))
     fig.suptitle("Label Drift — Default Rate Per Origination Cohort",
                  fontsize=14, fontweight="bold")
-    ax.bar(dates, default_rate, color="#9C27B0", width=20, alpha=0.75, zorder=3,
+    ax.bar(dates, default_rate, color="#9C27B0", width=pd.Timedelta(days=20), alpha=0.75, zorder=3,
            label="Cohort default rate")
     ax.axhline(baseline_rate, color="#333333", linestyle="--", linewidth=1.5,
                label=f"Mean default rate ({baseline_rate:.2%})")

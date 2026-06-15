@@ -171,10 +171,12 @@ def check_retrain_needed(ds: str, **kwargs) -> str:
         print("[branch] no champion — triggering initial training")
         return "train_challenger"
 
-    # Case 2: challenger already in shadow — retrain to keep it current
+    # Case 2: challenger already in shadow — let it continue accumulating evaluation months.
+    # Retraining here would reset consecutive-win tracking and prevent auto-promotion.
+    # PSI breach (Case 3) or AUC decay (Case 4) still trigger a new challenger when needed.
     if os.path.exists(challenger_path):
-        print("[branch] challenger in shadow mode — refreshing challenger")
-        return "train_challenger"
+        print("[branch] challenger in shadow mode — continuing evaluation, skipping retrain")
+        return "skip_training"
 
     # Case 3 + 4: check latest monitoring metrics
     mon_files = sorted(glob.glob(os.path.join(MONITORING_DIR, "monitoring_*.parquet")))
