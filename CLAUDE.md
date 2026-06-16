@@ -286,11 +286,24 @@ docker-compose up -d
 
 ## Known Issues and Fixes (ML-relevant)
 
-### PSI always red (fixed)
-Training-baseline PSI (current inference cohort vs training distribution aggregate) is
-structurally inflated — different population sizes, different MOB. **Fix:** Rolling PSI compares
-current month's scores vs prior 3 months of inference scores using the same scored
-population. Catches genuine drift, ignores structural offset.
+### PSI always red + excessive retraining (fixed)
+Root cause: `model_prediction.py` had a `_loan_customer_ids()` helper that accumulated
+ALL historical labeled cohorts instead of scoping to the current month. Each month's scored
+population grew (530 → 1060 → 1590 ...) so PSI compared different-sized groups each time →
+always flagged as drift → retrain triggered every month (9 archived champions).
+
+Two fixes applied together:
+
+- `model_prediction.py` — removed cohort filtering entirely. Inference now scores ALL
+  8,974 origination-month feature store visitors every month, giving a stable same-size
+  population for rolling PSI comparisons. Monitoring inner-joins with label store for AUC
+  (unaffected — still ~530 matched rows/month).
+- `ml_pipeline_dag.py` — PSI retrain trigger uses `tail(3).mean()` instead of `max()` to
+  avoid stale early-month noise (small cohorts) causing false drift alerts.
+- `data_processing_gold_table.py` — added `origination_date` column to label store
+  (= measurement `snapshot_date` - 6 months) so the store is self-documenting.
+
+Result: 1 training event (bootstrap only), all 17 PSI months green (< 0.031).
 
 ### AUC all null in monitoring (fixed)
 Monitoring was looking for labels at `pred_date + 6 months`. Label store is keyed by
