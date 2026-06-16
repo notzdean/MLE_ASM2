@@ -33,8 +33,12 @@ def process_labels_gold_table(snapshot_date_str, silver_loan_daily_directory, go
     df = df.withColumn("label", F.when(col("dpd") >= dpd, 1).otherwise(0).cast(IntegerType()))
     df = df.withColumn("label_def", F.lit(str(dpd)+'dpd_'+str(mob)+'mob').cast(StringType()))
 
+    # origination_date = measurement snapshot_date - 6 months (MOB offset)
+    # snapshot_date is the measurement date; origination_date is when the loan was taken
+    df = df.withColumn("origination_date", F.add_months(col("snapshot_date"), -mob))
+
     # select columns to save
-    df = df.select("loan_id", "Customer_ID", "label", "label_def", "snapshot_date")
+    df = df.select("loan_id", "Customer_ID", "label", "label_def", "snapshot_date", "origination_date")
 
     # save gold table - IRL connect to database to write
     partition_name = "gold_label_store_" + snapshot_date_str.replace('-','_') + '.parquet'

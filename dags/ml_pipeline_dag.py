@@ -97,6 +97,17 @@ def _create_spark():
 # ---------------------------------------------------------------------------
 def run_data_pipeline(ds: str, **kwargs):
     _make_dirs()
+
+    # Fast-path: if both gold outputs already exist for this month, skip Spark entirely.
+    # Spark JVM startup is the most expensive part (~2-3 min per month); skipping it
+    # when all files are already built saves the majority of re-run compute time.
+    date_tag         = ds.replace("-", "_")
+    gold_label_file  = os.path.join(GOLD_LABEL_DIR,   f"gold_label_store_{date_tag}.parquet")
+    gold_feature_file = os.path.join(GOLD_FEATURE_DIR, f"gold_feature_store_{date_tag}.parquet")
+    if os.path.exists(gold_label_file) and os.path.exists(gold_feature_file):
+        print(f"[data_pipeline] {ds} - gold outputs already exist, skipping Spark")
+        return
+
     spark = _create_spark()
 
     import utils.data_processing_bronze_table         as bronze_lms
@@ -186,11 +197,13 @@ def check_retrain_needed(ds: str, **kwargs) -> str:
 
     latest = pd.read_parquet(mon_files[-1])
 
-    # PSI breach
+    # PSI breach — check only the most recent 3 months to avoid stale early-month
+    # noise dominating the trigger (early months have high PSI due to small cohort
+    # sample sizes; we want to detect sustained recent drift, not historical spikes)
     if "psi_score" in latest.columns:
-        max_psi = latest["psi_score"].max()
-        if max_psi > PSI_RETRAIN_THRESHOLD:
-            print(f"[branch] PSI breach ({max_psi:.4f} > {PSI_RETRAIN_THRESHOLD}) — triggering retrain")
+        recent_psi = latest["psi_score"].dropna().tail(3)
+        if len(recent_psi) > 0 and recent_psi.mean() > PSI_RETRAIN_THRESHOLD:
+            print(f"[branch] PSI breach (recent 3-month mean={recent_psi.mean():.4f} > {PSI_RETRAIN_THRESHOLD}) — triggering retrain")
             return "train_challenger"
 
     # AUC decay vs baseline
